@@ -238,57 +238,87 @@ namespace VoiceForge.AI
             featuresFlat = null;
             frames = t;
 
-            // Exports disagree about the waveform input rank: flat [N],
-            // fairseq-style [1, N] and rank-3 [1, N, 1] audio tensors all exist
-            // in the wild. The shape the model itself declares is tried first
-            // (that is what ONNX Runtime validates against), then the well-known
-            // community flavors.
+            // Exports disagree about the waveform input rank AND axis order:
+            // flat [N], fairseq-style [1, N], [1, N, 1], [N, 1, 1] and [1, 1, N]
+            // audio tensors all exist in the wild. The shape the model itself
+            // declares is tried first (that is what ONNX Runtime validates
+            // against), then the well-known community flavors.
             List<int[]> shapes = new List<int[]>();
             int[] declared = TemplateShape(wav16k.Length);
             if (declared != null) shapes.Add(declared);
-            shapes.Add(new[] { 1, wav16k.Length });
             shapes.Add(new[] { 1, wav16k.Length, 1 });
+            shapes.Add(new[] { wav16k.Length, 1, 1 });
+            shapes.Add(new[] { 1, wav16k.Length });
             shapes.Add(new[] { wav16k.Length });
             shapes.Add(new[] { 1, 1, wav16k.Length });
 
             float[] result = null;
-            string lastError = null;
-            int[] lastShape = null;
+            int[] resultDims = null;
+            List<string> attempts = new List<string>();
             foreach (int[] shape in shapes)
             {
-                lastShape = shape;
-                result = RunHubertTry(wav16k, shape, ref lastError);
-                if (result != null) break;
+                int[] dims;
+                result = RunHubertTry(wav16k, shape, attempts, out dims);
+                if (result != null)
+                {
+                    resultDims = dims;
+                    break;
+                }
             }
             if (result == null)
             {
                 throw new ApplicationException(
-                    "HuBERT rejected input '" + hubertIn + "' in every known shape (tried " +
-                    DescribeShape(lastShape) + " last; the model declares " +
-                    (hubertInDims != null ? DescribeShape(hubertInDims) : "an unknown shape") + "). " +
-                    "Runtime error: " + (lastError ?? "no details") + ". " +
+                    "HuBERT rejected input '" + hubertIn + "' in every known shape.\n" +
+                    "Model declares: " + (hubertInDims != null ? DescribeShape(hubertInDims) : "an unknown shape") + "\n" +
+                    "Attempts:\n  " + string.Join("\n  ", attempts.ToArray()) + "\n" +
                     "Make sure the extractor is a HuBERT/ContentVec audio model - see models/README-AI-MODELS.txt.");
             }
             featuresFlat = result;
 
-            // Infer the real feature width from the output so 256-dim and
-            // 768-dim exports both work without any configuration.
-            if (featuresFlat.Length >= t)
+            // The conv frontend almost never produces exactly samples/320
+            // frames (kernel/stride rounding trims 1-2 frames), so the feature
+            // width must NOT be derived by dividing the output length by t -
+            // that yielded widths like 752 on 768-dim exports and broke the
+            // generator call. Trust the output tensor's own runtime shape.
+            if (resultDims != null && resultDims.Length >= 2)
             {
-                featureDim = Math.Max(1, featuresFlat.Length / t);
+                int lastDim = resultDims[resultDims.Length - 1];
+                if (lastDim > 1 && lastDim <= 4096) featureDim = lastDim;
             }
+            else if (featuresFlat.Length >= t)
+            {
+                // No shape info: snap to the known ContentVec widths first.
+                int guessed = 0;
+                int[] known = { 768, 256, 1024, 128 };
+                for (int k = 0; k < known.Length; k++)
+                {
+                    if (featuresFlat.Length % known[k] == 0 &&
+                        Math.Abs(featuresFlat.Length / known[k] - t) <= 4)
+                    {
+                        guessed = known[k];
+                        break;
+                    }
+                }
+                featureDim = guessed > 0 ? guessed : Math.Max(1, featuresFlat.Length / t);
+            }
+            if (featureDim < 1) featureDim = 1;
 
             int produced = featuresFlat.Length / featureDim;
-            if (produced < 1) produced = 1;
-            if (produced < t)
+            if (produced < 1)
             {
-                // Some exports trim the tail; pad the last frame so lengths match.
-                int dim = featureDim;
-                float[] padded = new float[t * dim];
+                // Degenerate output; emit zero features so downstream stays in bounds.
+                featuresFlat = new float[t * featureDim];
+            }
+            else if (produced < t)
+            {
+                // Some exports trim the tail; repeat the last frame so the
+                // feature rows line up with the frame grid again.
+                float[] padded = new float[t * featureDim];
                 Array.Copy(featuresFlat, padded, Math.Min(featuresFlat.Length, padded.Length));
-                for (int i = featuresFlat.Length; i < padded.Length; i++)
+                int lastRow = (produced - 1) * featureDim;
+                for (int r = produced; r < t; r++)
                 {
-                    padded[i] = padded[i - dim >= 0 ? i - dim : 0];
+                    Array.Copy(padded, lastRow, padded, r * featureDim, featureDim);
                 }
                 featuresFlat = padded;
             }
@@ -297,43 +327,40 @@ namespace VoiceForge.AI
 
         /// <summary>
         /// Runs HuBERT once with an explicit input shape. Returns null (instead
-        /// of throwing) when the session rejects it, so the caller can try the
-        /// next shape; the runtime error text comes back via <paramref name="error"/>.
+        /// of throwing) when the shape is unusable or the session rejects it,
+        /// so the caller can try the next shape; every attempt is appended to
+        /// <paramref name="attempts"/> for the final error report, and the
+        /// runtime output shape comes back via <paramref name="outDims"/>.
         /// </summary>
-        private float[] RunHubertTry(float[] wav16k, int[] shape, ref string error)
+        private float[] RunHubertTry(float[] wav16k, int[] shape, List<string> attempts, out int[] outDims)
         {
-            DenseTensor<float> input;
-            try
+            outDims = null;
+
+            // A candidate is only usable when it holds EXACTLY the sample count
+            // we have: the tensor wraps our buffer directly (zero copy), so a
+            // mismatched shape must be skipped rather than filled. The old
+            // per-element fill wrote past the end of tensors whose declared
+            // shape had fixed 1-sized axes ([1, 1, N] etc.) - that was the
+            // "Index was outside the bounds of the array" crash.
+            long product = 1;
+            for (int i = 0; i < shape.Length; i++) product *= shape[i];
+            if (product != wav16k.Length)
             {
-                input = new DenseTensor<float>(shape);
-            }
-            catch (Exception ex)
-            {
-                error = ex.Message;
+                attempts.Add(DescribeShape(shape) + " skipped (holds " + product +
+                             " samples, need " + wav16k.Length + ")");
                 return null;
             }
 
-            // Every candidate keeps exactly one free axis (size N) with all
-            // other axes 1, so a linear fill covers [N], [1,N], [1,N,1] and
-            // friends alike - it is just a reshape of a contiguous buffer.
-            int freeAxis = -1;
-            for (int a = 0; a < shape.Length; a++)
+            DenseTensor<float> input;
+            try
             {
-                if (shape[a] > 1)
-                {
-                    freeAxis = a;
-                    break;
-                }
+                input = new DenseTensor<float>(wav16k, shape);
             }
-            if (freeAxis < 0) freeAxis = shape.Length - 1;
-
-            int[] index = new int[shape.Length];
-            for (int i = 0; i < wav16k.Length; i++)
+            catch (Exception ex)
             {
-                index[freeAxis] = i;
-                input[index] = wav16k[i];
+                attempts.Add(DescribeShape(shape) + " rejected: " + ex.Message);
+                return null;
             }
-            index[freeAxis] = 0;
 
             var inputs = new List<NamedOnnxValue>();
             inputs.Add(NamedOnnxValue.CreateFromTensor(hubertIn, input));
@@ -344,16 +371,32 @@ namespace VoiceForge.AI
                 {
                     foreach (DisposableNamedOnnxValue v in results)
                     {
-                        if (!string.Equals(v.Name, hubertOut, StringComparison.Ordinal)) continue;
+                        bool matches = string.IsNullOrEmpty(hubertOut) ||
+                                       string.Equals(v.Name, hubertOut, StringComparison.Ordinal);
+                        if (!matches) continue;
+
+                        // Remember the runtime output shape: it is the only
+                        // reliable way to learn this export's real feature
+                        // width (256 vs 768) and frame count.
+                        try
+                        {
+                            Tensor<float> tensor = v.AsTensor<float>();
+                            outDims = tensor.Dimensions.ToArray();
+                        }
+                        catch
+                        {
+                            outDims = null;   // shape unavailable - flat copy still works
+                        }
                         return v.AsEnumerable<float>().ToArray();
                     }
                 }
-                error = "output tensor '" + hubertOut + "' was not produced";
+                attempts.Add(DescribeShape(shape) + " ran but output '" +
+                             (hubertOut ?? "(first output)") + "' was not produced");
                 return null;
             }
             catch (Exception ex)
             {
-                error = ex.Message;
+                attempts.Add(DescribeShape(shape) + " rejected: " + ex.Message);
                 return null;
             }
         }
