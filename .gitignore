@@ -1,0 +1,12 @@
+## Visual Studio / build artifacts
+bin/
+obj/
+*.user
+*.suo
+.vs/
+packages/
+*.nupkg
+project.lock.json
+
+## Runtime outputs
+*.wav

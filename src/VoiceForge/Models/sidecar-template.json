@@ -1,0 +1,21 @@
+{
+  "_comment": "Sidecar config copied next to a voice as <VoiceName>.json. All fields optional. Tensor names are auto-resolved at load time: the configured name wins, then known aliases (sid/ds, phone_length/phone_lengths), and length inputs that an export does not declare are skipped - so both the official 5-input RVC export and 7-input exports load without edits. Only set these if your export uses truly unusual names (inspect with Netron).",
+  "SampleRate": 40000,
+  "HopLength": 480,
+  "SpeakerId": 0,
+  "F0Min": 65.0,
+  "F0Max": 1100.0,
+  "YinThreshold": 0.15,
+  "HubertFile": "hubert.onnx",
+  "HubertInput": "source",
+  "HubertOutput": "embed",
+  "GenInputPhone": "phone",
+  "GenInputPhoneLength": "phone_length",
+  "GenInputPitch": "pitch",
+  "GenInputPitchLength": "pitch_length",
+  "GenInputPitchf": "pitchf",
+  "GenInputPitchfLength": "pitchf_length",
+  "GenInputSid": "sid",
+  "GenOutput": "audio",
+  "LengthsAsScalar": true
+}
